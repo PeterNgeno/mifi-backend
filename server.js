@@ -1,109 +1,118 @@
 const express = require('express');
 const axios = require('axios');
-const moment = require('moment');
-const dotenv = require('dotenv');
 const cors = require('cors');
+const dotenv = require('dotenv');
+const moment = require('moment');
 
 dotenv.config();
+
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-const PORT = process.env.PORT || 5000;
+// ENV variables
+const {
+  SHORTCODE,
+  PASSKEY,
+  CONSUMER_KEY,
+  CONSUMER_SECRET,
+  TILL_NUMBER,
+  CALLBACK_URL,
+  GSCRIPT_WEB_APP_URL, // Your Apps Script Web App URL
+} = process.env;
 
-// M-PESA credentials
-const { CONSUMER_KEY, CONSUMER_SECRET, PASSKEY, SHORTCODE, TILL_NUMBER } = process.env;
-
-// Google Sheet Web App endpoint
-const GOOGLE_SHEET_URL = "https://script.google.com/macros/s/AKfycbyN_1aBt73JjSlUXmBg2yrOQp0pkmZC9r6ITpzKI9fyATWaOxdAl3EwO_RvYHwd3BbO/exec";
-
-// Get access token from Safaricom
-async function getMpesaAccessToken() {
-  const auth = Buffer.from(`${CONSUMER_KEY}:${CONSUMER_SECRET}`).toString('base64');
-  const response = await axios.get(
-    'https://api.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials',
-    { headers: { Authorization: `Basic ${auth}` } }
-  );
-  return response.data.access_token;
+// Base64 password
+function generatePassword(timestamp) {
+  return Buffer.from(`${SHORTCODE}${PASSKEY}${timestamp}`).toString('base64');
 }
 
-// STK Push function
-async function sendSTKPush(phone, amount) {
-  const accessToken = await getMpesaAccessToken();
+// Generate timestamp
+function getTimestamp() {
+  return moment().format('YYYYMMDDHHmmss');
+}
 
-  const timestamp = moment().format('YYYYMMDDHHmmss');
-  const password = Buffer.from(`${SHORTCODE}${PASSKEY}${timestamp}`).toString('base64');
+// Get Safaricom access token
+async function getAccessToken() {
+  const auth = Buffer.from(`${CONSUMER_KEY}:${CONSUMER_SECRET}`).toString('base64');
+  const res = await axios.get('https://api.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials', {
+    headers: { Authorization: `Basic ${auth}` },
+  });
+  return res.data.access_token;
+}
+
+// STK Push request
+async function stkPush(phone, amount) {
+  const timestamp = getTimestamp();
+  const password = generatePassword(timestamp);
+  const token = await getAccessToken();
 
   const payload = {
     BusinessShortCode: SHORTCODE,
     Password: password,
     Timestamp: timestamp,
-    TransactionType: 'CustomerPayBillOnline',
+    TransactionType: 'CustomerBuygoodsOnline',
     Amount: amount,
     PartyA: phone,
-    PartyB: SHORTCODE,
+    PartyB: TILL_NUMBER,
     PhoneNumber: phone,
-    CallBackURL: "https://your-callback-url.com/payment",
-    AccountReference: "WIFI_ACCESS",
-    TransactionDesc: "WiFi Login"
+    CallBackURL: CALLBACK_URL,
+    AccountReference: 'WiFiAccess',
+    TransactionDesc: 'WiFi Access Payment',
   };
 
-  const response = await axios.post(
-    'https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest',
-    payload,
-    { headers: { Authorization: `Bearer ${accessToken}` } }
-  );
+  const res = await axios.post('https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest', payload, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
 
-  return response.data;
+  return res.data;
 }
 
-// Check if user has access in Google Sheet
-async function checkAccess(phone) {
-  const res = await axios.get(`${GOOGLE_SHEET_URL}?action=check&phone=${phone}`);
-  return res.data; // { access: true/false, expires: timestamp }
-}
+// Record to Google Sheet via Apps Script
+async function recordAccessToSheet(phone, amount) {
+  const now = moment();
+  let duration = 0;
 
-// Store new user access in Google Sheet
-async function saveAccess(phone, amount) {
-  const duration = amount === 100 ? 7 : 1; // days
-  const expires = moment().add(duration, 'days').format('YYYY-MM-DD HH:mm:ss');
-  const payload = {
-    action: 'save',
-    phone,
-    expires,
-    amount
-  };
-  await axios.post(GOOGLE_SHEET_URL, payload);
-}
-
-// Entry point for login
-app.post('/login', async (req, res) => {
-  const { phone, amount } = req.body;
-
-  if (![20, 100].includes(amount)) {
-    return res.status(400).json({ message: 'Invalid amount' });
+  if (amount == 20) {
+    duration = 5; // hours
+  } else if (amount == 100) {
+    duration = 168; // 7 days = 168 hours
   }
 
+  const expiry = now.add(duration, 'hours').format('YYYY-MM-DD HH:mm:ss');
+
+  await axios.post(GSCRIPT_WEB_APP_URL, {
+    phone,
+    amount,
+    expires_at: expiry,
+    timestamp: now.format('YYYY-MM-DD HH:mm:ss'),
+  });
+}
+
+// POST /pay
+app.post('/pay', async (req, res) => {
   try {
-    const existing = await checkAccess(phone);
-    if (existing.access && moment().isBefore(moment(existing.expires))) {
-      return res.json({ access: true, message: 'Already paid and access still valid.' });
+    const { phone, amount } = req.body;
+
+    if (![20, 100].includes(amount)) {
+      return res.status(400).json({ error: 'Invalid amount' });
     }
 
-    const stkResponse = await sendSTKPush(phone, amount);
+    const response = await stkPush(phone, amount);
 
-    if (stkResponse.ResponseCode === "0") {
-      await saveAccess(phone, amount); // You may delay this until callback
-      res.json({ access: true, message: 'STK Push sent. Complete on your phone.' });
+    if (response.ResponseCode === '0') {
+      await recordAccessToSheet(phone, amount);
+      return res.json({ success: true, message: 'STK Push Sent', checkoutRequestID: response.CheckoutRequestID });
     } else {
-      res.status(500).json({ access: false, message: 'Failed to send STK push.' });
+      return res.status(500).json({ success: false, error: response.ResponseDescription });
     }
-  } catch (error) {
-    console.error(error.response?.data || error.message);
-    res.status(500).json({ access: false, message: 'Something went wrong' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
+// Start server
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`✅ Server running on port ${PORT}`);
 });
