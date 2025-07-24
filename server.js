@@ -1,118 +1,80 @@
 const express = require('express');
+const bodyParser = require('body-parser');
 const axios = require('axios');
-const cors = require('cors');
-const dotenv = require('dotenv');
-const moment = require('moment');
-
-dotenv.config();
+require('dotenv').config();
 
 const app = express();
-app.use(cors());
-app.use(express.json());
+app.use(bodyParser.json());
+app.use(express.static('public')); // where index.html lives
 
-// ENV variables
-const {
-  SHORTCODE,
-  PASSKEY,
-  CONSUMER_KEY,
-  CONSUMER_SECRET,
-  TILL_NUMBER,
-  CALLBACK_URL,
-  GSCRIPT_WEB_APP_URL, // Your Apps Script Web App URL
-} = process.env;
+const PORT = process.env.PORT || 3000;
 
-// Base64 password
-function generatePassword(timestamp) {
-  return Buffer.from(`${SHORTCODE}${PASSKEY}${timestamp}`).toString('base64');
-}
+// ENV VARIABLES
+const consumerKey = process.env.CONSUMER_KEY;
+const consumerSecret = process.env.CONSUMER_SECRET;
+const shortcode = process.env.SHORTCODE; // Paybill
+const tillNumber = process.env.TILL_NUMBER;
+const passkey = process.env.PASSKEY;
+const callbackURL = process.env.CALLBACK_URL;
 
-// Generate timestamp
-function getTimestamp() {
-  return moment().format('YYYYMMDDHHmmss');
-}
+const sheetScriptURL = "https://script.google.com/macros/s/AKfycbyN_1aBt73JjSlUXmBg2yrOQp0pkmZC9r6ITpzKI9fyATWaOxdAl3EwO_RvYHwd3BbO/exec";
 
-// Get Safaricom access token
-async function getAccessToken() {
-  const auth = Buffer.from(`${CONSUMER_KEY}:${CONSUMER_SECRET}`).toString('base64');
+const getAccessToken = async () => {
+  const auth = Buffer.from(`${consumerKey}:${consumerSecret}`).toString('base64');
   const res = await axios.get('https://api.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials', {
-    headers: { Authorization: `Basic ${auth}` },
+    headers: { Authorization: `Basic ${auth}` }
   });
   return res.data.access_token;
-}
+};
 
-// STK Push request
-async function stkPush(phone, amount) {
+const getTimestamp = () => {
+  const now = new Date();
+  return now.toISOString().replace(/[-:TZ.]/g, '').slice(0, 14);
+};
+
+app.post('/pay', async (req, res) => {
+  const { phone, amount } = req.body;
   const timestamp = getTimestamp();
-  const password = generatePassword(timestamp);
+  const password = Buffer.from(`${shortcode}${passkey}${timestamp}`).toString('base64');
+
   const token = await getAccessToken();
 
-  const payload = {
-    BusinessShortCode: SHORTCODE,
-    Password: password,
-    Timestamp: timestamp,
-    TransactionType: 'CustomerBuygoodsOnline',
-    Amount: amount,
-    PartyA: phone,
-    PartyB: TILL_NUMBER,
-    PhoneNumber: phone,
-    CallBackURL: CALLBACK_URL,
-    AccountReference: 'WiFiAccess',
-    TransactionDesc: 'WiFi Access Payment',
-  };
-
-  const res = await axios.post('https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest', payload, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-
-  return res.data;
-}
-
-// Record to Google Sheet via Apps Script
-async function recordAccessToSheet(phone, amount) {
-  const now = moment();
-  let duration = 0;
-
-  if (amount == 20) {
-    duration = 5; // hours
-  } else if (amount == 100) {
-    duration = 168; // 7 days = 168 hours
-  }
-
-  const expiry = now.add(duration, 'hours').format('YYYY-MM-DD HH:mm:ss');
-
-  await axios.post(GSCRIPT_WEB_APP_URL, {
-    phone,
-    amount,
-    expires_at: expiry,
-    timestamp: now.format('YYYY-MM-DD HH:mm:ss'),
-  });
-}
-
-// POST /pay
-app.post('/pay', async (req, res) => {
   try {
-    const { phone, amount } = req.body;
+    const stkRes = await axios.post(
+      'https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest',
+      {
+        BusinessShortCode: shortcode,
+        Password: password,
+        Timestamp: timestamp,
+        TransactionType: 'CustomerBuyGoodsOnline',
+        Amount: amount,
+        PartyA: phone,
+        PartyB: tillNumber,
+        PhoneNumber: phone,
+        CallBackURL: callbackURL,
+        AccountReference: 'WiFi Access',
+        TransactionDesc: `${amount} payment for WiFi`
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${token}`
+        }
+      }
+    );
 
-    if (![20, 100].includes(amount)) {
-      return res.status(400).json({ error: 'Invalid amount' });
-    }
+    // Log to Google Sheets via Apps Script
+    await axios.post(sheetScriptURL, {
+      phone,
+      amount,
+      timestamp,
+      access: amount == "20" ? "5 Hours" : "1 Week"
+    });
 
-    const response = await stkPush(phone, amount);
-
-    if (response.ResponseCode === '0') {
-      await recordAccessToSheet(phone, amount);
-      return res.json({ success: true, message: 'STK Push Sent', checkoutRequestID: response.CheckoutRequestID });
-    } else {
-      return res.status(500).json({ success: false, error: response.ResponseDescription });
-    }
+    res.json({ success: true, message: 'STK push sent. Complete payment on your phone.' });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Server error' });
+    console.error(err.response?.data || err.message);
+    res.status(500).json({ success: false, message: 'Payment failed. Try again.' });
   }
 });
 
-// Start server
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`✅ Server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
